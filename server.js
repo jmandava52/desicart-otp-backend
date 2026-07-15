@@ -1,33 +1,6 @@
 // DesiCart OTP backend — sends and verifies real one-time codes.
 // Phone numbers go through Twilio Verify (real SMS). Email addresses
-// go through your own Gmail account via SMTP (Twilio Verify's email
-// channel needs a SendGrid account; this uses Gmail directly instead,
-// which is simpler if you already have a Gmail account for the business).
-//
-// Setup — SMS (phone):
-// 1. Create a free Twilio account: https://www.twilio.com/try-twilio
-//    New accounts get trial credit (enough for a few hundred verifications).
-// 2. In the Twilio Console, create a "Verify Service" — copy its SID
-//    (starts with "VA...").
-// 3. Copy .env.example to .env and fill in your Account SID, Auth Token,
-//    and Verify Service SID from the Twilio Console.
-//
-// Setup — Email (Gmail):
-// 1. Turn on 2-Step Verification on the Gmail account you want to send
-//    from: myaccount.google.com/security
-// 2. Create an App Password: myaccount.google.com/apppasswords
-// 3. Put that Gmail address and the 16-character app password into
-//    .env as GMAIL_USER and GMAIL_APP_PASSWORD.
-//
-// Either or both can be configured — the /send-otp and /verify-otp
-// endpoints route by whichever field (phone or email) is present.
-//
-// 4. npm install
-// 5. npm start        (runs locally on http://localhost:3000)
-//
-// To make this reachable from your phone, deploy it somewhere free like
-// Render.com or Railway.app, then put that URL into the app's
-// src/config.js as API_BASE_URL, and set OTP_DEMO_MODE to false.
+// go through your own Gmail account via SMTP.
 
 require("dotenv").config();
 const express = require("express");
@@ -63,16 +36,9 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const mailer = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  porconst mailer = nodemailer.createTransport({
-  host: "smtp.gmail.com",
   port: 587,
   secure: false,
   requireTLS: true,
-  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
-  family: 4,
-  connectionTimeout: 15000,
-});465,
-  secure: true,
   auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
   family: 4,
   connectionTimeout: 15000,
