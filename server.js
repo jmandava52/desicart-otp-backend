@@ -1,12 +1,7 @@
-// DesiCart OTP backend — sends and verifies real one-time codes.
-// Phone numbers go through Twilio Verify (real SMS). Email addresses
-// go through your own Gmail account via SMTP.
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const twilio = require("twilio");
-const nodemailer = require("nodemailer");
 
 const app = express();
 app.use(cors());
@@ -16,33 +11,18 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_VERIFY_SERVICE_SID,
-  GMAIL_USER,
-  GMAIL_APP_PASSWORD,
+  RESEND_API_KEY,
   PORT = 3000,
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_VERIFY_SERVICE_SID) {
-  console.warn(
-    "Warning: Twilio environment variables are missing — phone (SMS) codes won't work until .env is filled in."
-  );
+  console.warn("Warning: Twilio environment variables are missing.");
 }
-if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
-  console.warn(
-    "Warning: Gmail environment variables are missing — email codes won't work until .env is filled in."
-  );
+if (!RESEND_API_KEY) {
+  console.warn("Warning: RESEND_API_KEY is missing.");
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
-const mailer = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
-  family: 4,
-  connectionTimeout: 15000,
-});
 
 function toE164(phone) {
   const digits = phone.replace(/[^0-9]/g, "");
@@ -61,13 +41,25 @@ function generateCode() {
 async function sendEmailCode(email) {
   const code = generateCode();
   emailCodes.set(email, { code, expiresAt: Date.now() + EMAIL_CODE_TTL_MS });
-  await mailer.sendMail({
-    from: `DesiCart <${GMAIL_USER}>`,
-    to: email,
-    subject: "Your DesiCart verification code",
-    text: `Your DesiCart verification code is ${code}. It expires in 10 minutes.`,
-    html: `<p>Your DesiCart verification code is:</p><h2 style="letter-spacing:4px;">${code}</h2><p>It expires in 10 minutes.</p>`,
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "DesiCart <onboarding@resend.dev>",
+      to: [email],
+      subject: "Your DesiCart verification code",
+      html: `<p>Your DesiCart verification code is:</p><h2 style="letter-spacing:4px;">${code}</h2><p>It expires in 10 minutes.</p>`,
+    }),
   });
+
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Resend error (${res.status}): ${detail}`);
+  }
 }
 
 function checkEmailCode(email, code) {
