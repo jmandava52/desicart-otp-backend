@@ -68,28 +68,17 @@ const mailer = nodemailer.createTransport({
   auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
   family: 4,
   connectionTimeout: 15000,
-});createTransport({
-  service: "gmail",
-  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
 });
 
-// Normalizes a phone number to E.164 format (e.g. +16165550132), which is
-// what Twilio requires. This is a simple default-to-US-number helper —
-// for other countries, have the app collect a country code explicitly.
 function toE164(phone) {
   const digits = phone.replace(/[^0-9]/g, "");
   if (phone.trim().startsWith("+")) return `+${digits}`;
-  if (digits.length === 10) return `+1${digits}`; // assume US
+  if (digits.length === 10) return `+1${digits}`;
   return `+${digits}`;
 }
 
-// Simple in-memory store for email codes: { "user@example.com": { code, expiresAt } }
-// This resets whenever the server restarts, and doesn't share state across
-// multiple server instances — fine for getting started, but a production
-// deployment should move this into a real database (e.g. Redis or Postgres)
-// once traffic grows.
 const emailCodes = new Map();
-const EMAIL_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
 
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -111,7 +100,7 @@ function checkEmailCode(email, code) {
   const entry = emailCodes.get(email);
   if (!entry) return false;
   const valid = entry.code === code && Date.now() < entry.expiresAt;
-  if (valid) emailCodes.delete(email); // one-time use
+  if (valid) emailCodes.delete(email);
   return valid;
 }
 
