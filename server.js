@@ -61,7 +61,7 @@ if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-const mailer = nodemailer.const mailer = nodemailer.createTransport({
+const mailer = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
   secure: true,
