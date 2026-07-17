@@ -49,7 +49,7 @@ async function sendEmailCode(email) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: "DesiCart <onboarding@resend.dev>",
+      from: "DesiCart <otp@agriitsolutions.org>",
       to: [email],
       subject: "Your DesiCart verification code",
       html: `<p>Your DesiCart verification code is:</p><h2 style="letter-spacing:4px;">${code}</h2><p>It expires in 10 minutes.</p>`,
