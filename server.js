@@ -1,9 +1,3 @@
-// DesiCart OTP backend — sends and verifies real one-time codes.
-// Phone numbers go through Twilio Verify (real SMS). Email addresses
-// go through Resend, an email API that sends over normal HTTPS — unlike
-// raw SMTP, this isn't blocked by hosts like Render's free tier that
-// restrict outbound SMTP ports.
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -11,7 +5,9 @@ const twilio = require("twilio");
 
 const app = express();
 app.use(cors());
-app.use(app.use(express.json({ limit: "8mb" }));express.json());
+// Default body size limit is 100kb — too small for a profile photo sent
+// as embedded base64 image data. Raised here to accommodate that.
+app.use(express.json({ limit: "8mb" }));
 
 const {
   TWILIO_ACCOUNT_SID,
