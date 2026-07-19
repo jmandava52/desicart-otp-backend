@@ -1,39 +1,13 @@
 // DesiCart OTP backend — sends and verifies real one-time codes.
 // Phone numbers go through Twilio Verify (real SMS). Email addresses
-// go through your own Gmail account via SMTP (Twilio Verify's email
-// channel needs a SendGrid account; this uses Gmail directly instead,
-// which is simpler if you already have a Gmail account for the business).
-//
-// Setup — SMS (phone):
-// 1. Create a free Twilio account: https://www.twilio.com/try-twilio
-//    New accounts get trial credit (enough for a few hundred verifications).
-// 2. In the Twilio Console, create a "Verify Service" — copy its SID
-//    (starts with "VA...").
-// 3. Copy .env.example to .env and fill in your Account SID, Auth Token,
-//    and Verify Service SID from the Twilio Console.
-//
-// Setup — Email (Gmail):
-// 1. Turn on 2-Step Verification on the Gmail account you want to send
-//    from: myaccount.google.com/security
-// 2. Create an App Password: myaccount.google.com/apppasswords
-// 3. Put that Gmail address and the 16-character app password into
-//    .env as GMAIL_USER and GMAIL_APP_PASSWORD.
-//
-// Either or both can be configured — the /send-otp and /verify-otp
-// endpoints route by whichever field (phone or email) is present.
-//
-// 4. npm install
-// 5. npm start        (runs locally on http://localhost:3000)
-//
-// To make this reachable from your phone, deploy it somewhere free like
-// Render.com or Railway.app, then put that URL into the app's
-// src/config.js as API_BASE_URL, and set OTP_DEMO_MODE to false.
+// go through Resend, an email API that sends over normal HTTPS — unlike
+// raw SMTP, this isn't blocked by hosts like Render's free tier that
+// restrict outbound SMTP ports.
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const twilio = require("twilio");
-const nodemailer = require("nodemailer");
 
 const app = express();
 app.use(cors());
@@ -43,46 +17,28 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_VERIFY_SERVICE_SID,
-  GMAIL_USER,
-  GMAIL_APP_PASSWORD,
+  RESEND_API_KEY,
   PORT = 3000,
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_VERIFY_SERVICE_SID) {
-  console.warn(
-    "Warning: Twilio environment variables are missing — phone (SMS) codes won't work until .env is filled in."
-  );
+  console.warn("Warning: Twilio environment variables are missing.");
 }
-if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
-  console.warn(
-    "Warning: Gmail environment variables are missing — email codes won't work until .env is filled in."
-  );
+if (!RESEND_API_KEY) {
+  console.warn("Warning: RESEND_API_KEY is missing.");
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-const mailer = nodemailer.createTransport({
-  service: "gmail",
-  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
-});
-
-// Normalizes a phone number to E.164 format (e.g. +16165550132), which is
-// what Twilio requires. This is a simple default-to-US-number helper —
-// for other countries, have the app collect a country code explicitly.
 function toE164(phone) {
   const digits = phone.replace(/[^0-9]/g, "");
   if (phone.trim().startsWith("+")) return `+${digits}`;
-  if (digits.length === 10) return `+1${digits}`; // assume US
+  if (digits.length === 10) return `+1${digits}`;
   return `+${digits}`;
 }
 
-// Simple in-memory store for email codes: { "user@example.com": { code, expiresAt } }
-// This resets whenever the server restarts, and doesn't share state across
-// multiple server instances — fine for getting started, but a production
-// deployment should move this into a real database (e.g. Redis or Postgres)
-// once traffic grows.
 const emailCodes = new Map();
-const EMAIL_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
 
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -91,20 +47,32 @@ function generateCode() {
 async function sendEmailCode(email) {
   const code = generateCode();
   emailCodes.set(email, { code, expiresAt: Date.now() + EMAIL_CODE_TTL_MS });
-  await mailer.sendMail({
-    from: `DesiCart <${GMAIL_USER}>`,
-    to: email,
-    subject: "Your DesiCart verification code",
-    text: `Your DesiCart verification code is ${code}. It expires in 10 minutes.`,
-    html: `<p>Your DesiCart verification code is:</p><h2 style="letter-spacing:4px;">${code}</h2><p>It expires in 10 minutes.</p>`,
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "DesiCart <otp@agriitsolutions.org>",
+      to: [email],
+      subject: "Your DesiCart verification code",
+      html: `<p>Your DesiCart verification code is:</p><h2 style="letter-spacing:4px;">${code}</h2><p>It expires in 10 minutes.</p>`,
+    }),
   });
+
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Resend error (${res.status}): ${detail}`);
+  }
 }
 
 function checkEmailCode(email, code) {
   const entry = emailCodes.get(email);
   if (!entry) return false;
   const valid = entry.code === code && Date.now() < entry.expiresAt;
-  if (valid) emailCodes.delete(email); // one-time use
+  if (valid) emailCodes.delete(email);
   return valid;
 }
 
@@ -151,5 +119,96 @@ app.post("/verify-otp", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.send("DesiCart OTP backend is running."));
+
+let orders = [];
+let orderIdCounter = 1000;
+const dasherRegistry = {};
+
+app.get("/orders", (req, res) => {
+  res.json({ orders });
+});
+
+app.post("/orders", (req, res) => {
+  const { custName, custPhone, custEmail, storeId, address, items, subtotal, deliveryFee, tip, total } = req.body;
+  if (!custName || !storeId || !items || !items.length) {
+    return res.status(400).json({ error: "custName, storeId, and items are required" });
+  }
+  orderIdCounter += 1;
+  const order = {
+    id: orderIdCounter,
+    custName,
+    custPhone: custPhone || null,
+    custEmail: custEmail || null,
+    storeId,
+    address: address || null,
+    items,
+    subtotal: subtotal || 0,
+    deliveryFee: deliveryFee || 0,
+    tip: tip || 0,
+    total: total || 0,
+    status: "placed",
+    placedAt: Date.now(),
+    dasherName: null,
+    dasherPhone: null,
+    dasherPhoto: null,
+    dasherVehicle: null,
+  };
+  orders.push(order);
+  res.status(201).json({ order });
+});
+
+app.post("/orders/:id/accept", (req, res) => {
+  const id = Number(req.params.id);
+  const { dasherName, dasherPhone, dasherPhoto, dasherVehicle } = req.body;
+  const order = orders.find((o) => o.id === id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (order.status !== "placed") return res.status(409).json({ error: "Order already accepted" });
+
+  order.status = "assigned";
+  order.dasherName = dasherName;
+  order.dasherPhone = dasherPhone || null;
+  order.dasherPhoto = dasherPhoto || null;
+  order.dasherVehicle = dasherVehicle || null;
+  res.json({ order });
+});
+
+app.post("/orders/:id/advance", (req, res) => {
+  const id = Number(req.params.id);
+  const order = orders.find((o) => o.id === id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+
+  const next = { assigned: "picked_up", picked_up: "on_the_way", on_the_way: "delivered" }[order.status];
+  if (!next) return res.status(409).json({ error: `Cannot advance an order that is ${order.status}` });
+
+  order.status = next;
+  res.json({ order });
+});
+
+app.get("/dashers", (req, res) => {
+  res.json({ dashers: Object.values(dasherRegistry) });
+});
+
+app.post("/dashers", (req, res) => {
+  const { name, phone, email, vehicleMake, vehiclePlate, licenseNumber, photoUri } = req.body;
+  if (!name || !phone || !email) {
+    return res.status(400).json({ error: "name, phone, and email are required" });
+  }
+
+  const emailLower = email.trim().toLowerCase();
+  const licenseUpper = (licenseNumber || "").trim().toUpperCase();
+  for (const [existingPhone, d] of Object.entries(dasherRegistry)) {
+    if (existingPhone === phone) continue;
+    if (d.email && d.email.trim().toLowerCase() === emailLower) {
+      return res.status(409).json({ error: "email", message: "This email is already registered to another dasher account." });
+    }
+    if (licenseUpper && d.licenseNumber && d.licenseNumber.trim().toUpperCase() === licenseUpper) {
+      return res.status(409).json({ error: "license", message: "This license number is already registered to another dasher account." });
+    }
+  }
+
+  const profile = { name, phone, email, vehicleMake, vehiclePlate, licenseNumber, photoUri: photoUri || null };
+  dasherRegistry[phone] = profile;
+  res.status(201).json({ dasher: profile });
+});
 
 app.listen(PORT, () => console.log(`DesiCart OTP backend listening on port ${PORT}`));
