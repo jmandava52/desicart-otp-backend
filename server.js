@@ -1,3 +1,21 @@
+// DesiCart backend — OTP verification, plus orders and dasher accounts
+// persisted in a real Postgres database (via Neon's free tier) instead
+// of in-memory storage. This means data survives server restarts,
+// redeploys, and idle spin-downs — the previous version lost everything
+// whenever the server process restarted.
+//
+// Setup — Database (Neon):
+// 1. Sign up free at https://neon.tech (no card required, no 30-day
+//    expiration like Render's own free Postgres has).
+// 2. Create a project. Copy the connection string it gives you (looks
+//    like postgres://user:password@host/dbname?sslmode=require).
+// 3. Put it in .env as DATABASE_URL.
+// 4. Tables are created automatically the first time this server starts
+//    — no manual migration step needed.
+//
+// Setup — SMS (Twilio) and Email (Resend): unchanged from before, see
+// TWILIO_* and RESEND_API_KEY in .env.example.
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -6,6 +24,8 @@ const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
+// Default body size limit is 100kb — too small for a profile photo sent
+// as embedded base64 image data. Raised here to accommodate that.
 app.use(express.json({ limit: "8mb" }));
 
 const {
@@ -57,6 +77,14 @@ async function ensureSchema() {
       dasher_vehicle TEXT
     );
   `);
+  // Added after the table already existed in production — ALTER with
+  // IF NOT EXISTS so this is safe to run on every startup, on both a
+  // fresh database and one that already has orders in it.
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo TEXT;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo TEXT;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_lat NUMERIC;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_lng NUMERIC;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS location_updated_at BIGINT;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS dashers (
       phone TEXT PRIMARY KEY,
@@ -68,6 +96,9 @@ async function ensureSchema() {
       photo_uri TEXT
     );
   `);
+  // Case-insensitive uniqueness on email always; on license only when
+  // one is actually provided (empty/null license numbers shouldn't
+  // collide with each other).
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS dashers_email_unique ON dashers (LOWER(email));
   `);
@@ -77,6 +108,9 @@ async function ensureSchema() {
   `);
 }
 
+// Converts a Postgres row (snake_case) into the camelCase shape both
+// apps already expect — this is why neither app needed any changes
+// when this backend switched from memory to a real database.
 function mapOrderRow(row) {
   return {
     id: row.id,
@@ -96,6 +130,11 @@ function mapOrderRow(row) {
     dasherPhone: row.dasher_phone,
     dasherPhoto: row.dasher_photo,
     dasherVehicle: row.dasher_vehicle,
+    pickupPhoto: row.pickup_photo,
+    deliveryPhoto: row.delivery_photo,
+    dasherLat: row.dasher_lat !== null && row.dasher_lat !== undefined ? Number(row.dasher_lat) : null,
+    dasherLng: row.dasher_lng !== null && row.dasher_lng !== undefined ? Number(row.dasher_lng) : null,
+    locationUpdatedAt: row.location_updated_at ? Number(row.location_updated_at) : null,
   };
 }
 
@@ -271,6 +310,7 @@ app.post("/orders/:id/accept", async (req, res) => {
 app.post("/orders/:id/advance", async (req, res) => {
   try {
     const id = Number(req.params.id);
+    const { photo } = req.body;
     const existing = await pool.query("SELECT status FROM orders WHERE id=$1", [id]);
     if (!existing.rows.length) return res.status(404).json({ error: "Order not found" });
 
@@ -278,15 +318,54 @@ app.post("/orders/:id/advance", async (req, res) => {
     const next = { assigned: "picked_up", picked_up: "on_the_way", on_the_way: "delivered" }[current];
     if (!next) return res.status(409).json({ error: `Cannot advance an order that is ${current}` });
 
-    const result = await pool.query(
-      "UPDATE orders SET status=$1 WHERE id=$2 AND status=$3 RETURNING *",
-      [next, id, current]
-    );
+    // A photo is required for the two customer-facing proof steps:
+    // picking up the order (leaving "assigned") and completing delivery
+    // (leaving "on_the_way"). The middle step (picked_up -> on_the_way)
+    // doesn't need one.
+    const needsPhoto = current === "assigned" || current === "on_the_way";
+    if (needsPhoto && !photo) {
+      return res.status(400).json({ error: "photo_required", message: "A photo is required for this step." });
+    }
+
+    const photoColumn = current === "assigned" ? "pickup_photo" : current === "on_the_way" ? "delivery_photo" : null;
+
+    const result = photoColumn
+      ? await pool.query(
+          `UPDATE orders SET status=$1, ${photoColumn}=$2 WHERE id=$3 AND status=$4 RETURNING *`,
+          [next, photo, id, current]
+        )
+      : await pool.query("UPDATE orders SET status=$1 WHERE id=$2 AND status=$3 RETURNING *", [next, id, current]);
+
     if (!result.rows.length) return res.status(409).json({ error: "Order status changed, please refresh" });
     res.json({ order: mapOrderRow(result.rows[0]) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not update order" });
+  }
+});
+
+// Dasher's phone posts its current GPS position here every ~15 seconds
+// while an order is active. Restricted to orders that are actually in
+// progress, so a delivered order's last-known location doesn't keep
+// getting overwritten by a dasher who's moved on to something else.
+app.post("/orders/:id/location", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { lat, lng } = req.body;
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      return res.status(400).json({ error: "lat and lng (numbers) are required" });
+    }
+    const result = await pool.query(
+      `UPDATE orders SET dasher_lat=$1, dasher_lng=$2, location_updated_at=$3
+       WHERE id=$4 AND status IN ('assigned','picked_up','on_the_way')
+       RETURNING *`,
+      [lat, lng, Date.now(), id]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: "Order is not active" });
+    res.json({ order: mapOrderRow(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update location" });
   }
 });
 
@@ -323,6 +402,8 @@ app.post("/dashers", async (req, res) => {
     res.status(201).json({ dasher: mapDasherRow(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
+      // Unique constraint violation — figure out which one from the
+      // Postgres constraint/index name so the app can show the right message.
       const constraint = err.constraint || "";
       if (constraint.includes("email")) {
         return res.status(409).json({ error: "email", message: "This email is already registered to another dasher account." });
@@ -342,5 +423,7 @@ ensureSchema()
   })
   .catch((err) => {
     console.error("Failed to set up database tables:", err.message);
+    // Start anyway — OTP endpoints still work even if the database is
+    // misconfigured, only /orders and /dashers will fail.
     app.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT} (database setup failed)`));
   });
