@@ -1,21 +1,3 @@
-// DesiCart backend — OTP verification, plus orders and dasher accounts
-// persisted in a real Postgres database (via Neon's free tier) instead
-// of in-memory storage. This means data survives server restarts,
-// redeploys, and idle spin-downs — the previous version lost everything
-// whenever the server process restarted.
-//
-// Setup — Database (Neon):
-// 1. Sign up free at https://neon.tech (no card required, no 30-day
-//    expiration like Render's own free Postgres has).
-// 2. Create a project. Copy the connection string it gives you (looks
-//    like postgres://user:password@host/dbname?sslmode=require).
-// 3. Put it in .env as DATABASE_URL.
-// 4. Tables are created automatically the first time this server starts
-//    — no manual migration step needed.
-//
-// Setup — SMS (Twilio) and Email (Resend): unchanged from before, see
-// TWILIO_* and RESEND_API_KEY in .env.example.
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -24,8 +6,6 @@ const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
-// Default body size limit is 100kb — too small for a profile photo sent
-// as embedded base64 image data. Raised here to accommodate that.
 app.use(express.json({ limit: "8mb" }));
 
 const {
@@ -48,6 +28,11 @@ if (!DATABASE_URL) {
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+const STORE_NAMES = {
+  spice: { name: "Spice of India", addr: "2847 28th St SE, Grand Rapids, MI" },
+  everest: { name: "Everest Marketplace", addr: "1233 Kalamazoo Ave SE, Grand Rapids, MI" },
+};
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -77,9 +62,6 @@ async function ensureSchema() {
       dasher_vehicle TEXT
     );
   `);
-  // Added after the table already existed in production — ALTER with
-  // IF NOT EXISTS so this is safe to run on every startup, on both a
-  // fresh database and one that already has orders in it.
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_photo TEXT;`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_photo TEXT;`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_lat NUMERIC;`);
@@ -96,9 +78,6 @@ async function ensureSchema() {
       photo_uri TEXT
     );
   `);
-  // Case-insensitive uniqueness on email always; on license only when
-  // one is actually provided (empty/null license numbers shouldn't
-  // collide with each other).
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS dashers_email_unique ON dashers (LOWER(email));
   `);
@@ -108,9 +87,6 @@ async function ensureSchema() {
   `);
 }
 
-// Converts a Postgres row (snake_case) into the camelCase shape both
-// apps already expect — this is why neither app needed any changes
-// when this backend switched from memory to a real database.
 function mapOrderRow(row) {
   return {
     id: row.id,
@@ -194,6 +170,65 @@ function checkEmailCode(email, code) {
   const valid = entry.code === code && Date.now() < entry.expiresAt;
   if (valid) emailCodes.delete(email);
   return valid;
+}
+
+async function sendReceiptEmail(order) {
+  if (!order.custEmail) return;
+  const store = STORE_NAMES[order.storeId] || { name: order.storeId, addr: "" };
+
+  const itemRows = (order.items || [])
+    .map((it) => {
+      const name = it.name || it.id;
+      const unit = it.unit ? ` (${it.unit})` : "";
+      const price = typeof it.price === "number" ? it.price : 0;
+      const lineTotal = (price * (it.qty || 1)).toFixed(2);
+      return `<tr>
+        <td style="padding:6px 0;">${name}${unit} × ${it.qty}</td>
+        <td style="padding:6px 0; text-align:right;">$${lineTotal}</td>
+      </tr>`;
+    })
+    .join("");
+
+  const html = `
+    <div style="font-family:sans-serif; max-width:480px; margin:0 auto;">
+      <h2 style="margin-bottom:0;">Your DesiCart Receipt</h2>
+      <p style="color:#666; margin-top:4px;">Order #${order.id} · ${store.name}</p>
+      <p style="color:#666; font-size:13px;">${new Date(order.placedAt).toLocaleString()}</p>
+      <table style="width:100%; border-collapse:collapse; margin-top:16px;">
+        ${itemRows}
+      </table>
+      <table style="width:100%; border-collapse:collapse; margin-top:12px; border-top:1px dashed #ccc; padding-top:8px;">
+        <tr><td style="padding:4px 0; color:#666;">Subtotal</td><td style="padding:4px 0; text-align:right; color:#666;">$${Number(order.subtotal || 0).toFixed(2)}</td></tr>
+        <tr><td style="padding:4px 0; color:#666;">Delivery fee</td><td style="padding:4px 0; text-align:right; color:#666;">$${Number(order.deliveryFee || 0).toFixed(2)}</td></tr>
+        <tr><td style="padding:4px 0; color:#666;">Dasher tip</td><td style="padding:4px 0; text-align:right; color:#666;">$${Number(order.tip || 0).toFixed(2)}</td></tr>
+        <tr><td style="padding:8px 0; font-weight:bold; font-size:16px;">Total</td><td style="padding:8px 0; text-align:right; font-weight:bold; font-size:16px;">$${Number(order.total || 0).toFixed(2)}</td></tr>
+      </table>
+      ${order.dasherName ? `<p style="color:#666; font-size:13px; margin-top:16px;">Delivered by ${order.dasherName}</p>` : ""}
+      <p style="color:#999; font-size:12px; margin-top:24px;">Thanks for ordering from DesiCart! This is an automated receipt — please don't reply to this email.</p>
+    </div>
+  `;
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "DesiCart <no-reply@agriitsolutions.org>",
+        to: [order.custEmail],
+        subject: `Your DesiCart receipt — Order #${order.id}`,
+        html,
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      console.error(`Failed to send receipt for order #${order.id}: ${res.status} ${detail}`);
+    }
+  } catch (err) {
+    console.error(`Failed to send receipt for order #${order.id}:`, err.message);
+  }
 }
 
 app.post("/send-otp", async (req, res) => {
@@ -318,10 +353,6 @@ app.post("/orders/:id/advance", async (req, res) => {
     const next = { assigned: "picked_up", picked_up: "on_the_way", on_the_way: "delivered" }[current];
     if (!next) return res.status(409).json({ error: `Cannot advance an order that is ${current}` });
 
-    // A photo is required for the two customer-facing proof steps:
-    // picking up the order (leaving "assigned") and completing delivery
-    // (leaving "on_the_way"). The middle step (picked_up -> on_the_way)
-    // doesn't need one.
     const needsPhoto = current === "assigned" || current === "on_the_way";
     if (needsPhoto && !photo) {
       return res.status(400).json({ error: "photo_required", message: "A photo is required for this step." });
@@ -337,17 +368,19 @@ app.post("/orders/:id/advance", async (req, res) => {
       : await pool.query("UPDATE orders SET status=$1 WHERE id=$2 AND status=$3 RETURNING *", [next, id, current]);
 
     if (!result.rows.length) return res.status(409).json({ error: "Order status changed, please refresh" });
-    res.json({ order: mapOrderRow(result.rows[0]) });
+    const order = mapOrderRow(result.rows[0]);
+
+    if (order.status === "delivered") {
+      sendReceiptEmail(order).catch((err) => console.error("Receipt email error:", err.message));
+    }
+
+    res.json({ order });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not update order" });
   }
 });
 
-// Dasher's phone posts its current GPS position here every ~15 seconds
-// while an order is active. Restricted to orders that are actually in
-// progress, so a delivered order's last-known location doesn't keep
-// getting overwritten by a dasher who's moved on to something else.
 app.post("/orders/:id/location", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -402,8 +435,6 @@ app.post("/dashers", async (req, res) => {
     res.status(201).json({ dasher: mapDasherRow(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
-      // Unique constraint violation — figure out which one from the
-      // Postgres constraint/index name so the app can show the right message.
       const constraint = err.constraint || "";
       if (constraint.includes("email")) {
         return res.status(409).json({ error: "email", message: "This email is already registered to another dasher account." });
@@ -423,7 +454,5 @@ ensureSchema()
   })
   .catch((err) => {
     console.error("Failed to set up database tables:", err.message);
-    // Start anyway — OTP endpoints still work even if the database is
-    // misconfigured, only /orders and /dashers will fail.
     app.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT} (database setup failed)`));
   });
