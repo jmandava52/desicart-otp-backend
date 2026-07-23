@@ -1,12 +1,29 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
 const twilio = require("twilio");
 const { Pool } = require("pg");
+const { getDrivingEta } = require("./services/eta");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
+
+// Wrapping in a raw http server (instead of app.listen directly) lets
+// socket.io attach to the same port for live order tracking.
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: "*" }, // tighten to your app's origin(s) before production
+});
+
+// Rooms are per-order (order:<id>) — customer app joins on mount to get
+// live dasher_location/order_status pushes without polling.
+io.on("connection", (socket) => {
+  socket.on("join_order_room", (orderId) => socket.join(`order:${orderId}`));
+  socket.on("leave_order_room", (orderId) => socket.leave(`order:${orderId}`));
+});
 
 const {
   TWILIO_ACCOUNT_SID,
@@ -29,9 +46,12 @@ if (!DATABASE_URL) {
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
+// lat/lng are approximate for each store's street address — swap in exact
+// geocoded coordinates when available. Used as the fixed pickup marker/
+// origin point for tracking + ETA.
 const STORE_NAMES = {
-  spice: { name: "Spice of India", addr: "2847 28th St SE, Grand Rapids, MI" },
-  everest: { name: "Everest Marketplace", addr: "1233 Kalamazoo Ave SE, Grand Rapids, MI" },
+  spice: { name: "Spice of India", addr: "2847 28th St SE, Grand Rapids, MI", lat: 42.9008, lng: -85.6206 },
+  everest: { name: "Everest Marketplace", addr: "1233 Kalamazoo Ave SE, Grand Rapids, MI", lat: 42.9287, lng: -85.6494 },
 };
 
 const pool = new Pool({
@@ -67,6 +87,14 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_lat NUMERIC;`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_lng NUMERIC;`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS location_updated_at BIGINT;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_heading NUMERIC;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dasher_speed NUMERIC;`);
+  // Customer's geocoded delivery point — not populated by checkout yet (no
+  // address geocoding step there), so this stays null until that's added.
+  // The tracking screen just skips the delivery marker when it's null.
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat NUMERIC;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng NUMERIC;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS status_history JSONB DEFAULT '[]'::jsonb;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS dashers (
       phone TEXT PRIMARY KEY,
@@ -110,7 +138,15 @@ function mapOrderRow(row) {
     deliveryPhoto: row.delivery_photo,
     dasherLat: row.dasher_lat !== null && row.dasher_lat !== undefined ? Number(row.dasher_lat) : null,
     dasherLng: row.dasher_lng !== null && row.dasher_lng !== undefined ? Number(row.dasher_lng) : null,
+    dasherHeading: row.dasher_heading !== null && row.dasher_heading !== undefined ? Number(row.dasher_heading) : null,
+    dasherSpeed: row.dasher_speed !== null && row.dasher_speed !== undefined ? Number(row.dasher_speed) : null,
     locationUpdatedAt: row.location_updated_at ? Number(row.location_updated_at) : null,
+    deliveryLat: row.delivery_lat !== null && row.delivery_lat !== undefined ? Number(row.delivery_lat) : null,
+    deliveryLng: row.delivery_lng !== null && row.delivery_lng !== undefined ? Number(row.delivery_lng) : null,
+    statusHistory: row.status_history || [],
+    pickupLocation: STORE_NAMES[row.store_id]
+      ? { lat: STORE_NAMES[row.store_id].lat, lng: STORE_NAMES[row.store_id].lng, address: STORE_NAMES[row.store_id].addr }
+      : null,
   };
 }
 
@@ -291,10 +327,11 @@ app.post("/orders", async (req, res) => {
     if (!custName || !storeId || !items || !items.length) {
       return res.status(400).json({ error: "custName, storeId, and items are required" });
     }
+    const placedAt = Date.now();
     const result = await pool.query(
       `INSERT INTO orders
-        (cust_name, cust_phone, cust_email, store_id, address, items, subtotal, delivery_fee, tip, total, status, placed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'placed',$11)
+        (cust_name, cust_phone, cust_email, store_id, address, items, subtotal, delivery_fee, tip, total, status, placed_at, status_history)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'placed',$11,$12)
        RETURNING *`,
       [
         custName,
@@ -307,7 +344,8 @@ app.post("/orders", async (req, res) => {
         deliveryFee || 0,
         tip || 0,
         total || 0,
-        Date.now(),
+        placedAt,
+        JSON.stringify([{ status: "placed", at: placedAt }]),
       ]
     );
     res.status(201).json({ order: mapOrderRow(result.rows[0]) });
@@ -323,14 +361,29 @@ app.post("/orders/:id/accept", async (req, res) => {
     const { dasherName, dasherPhone, dasherPhoto, dasherVehicle } = req.body;
 
     const result = await pool.query(
-      `UPDATE orders SET status='assigned', dasher_name=$1, dasher_phone=$2, dasher_photo=$3, dasher_vehicle=$4
-       WHERE id=$5 AND status='placed'
+      `UPDATE orders SET status='assigned', dasher_name=$1, dasher_phone=$2, dasher_photo=$3, dasher_vehicle=$4,
+         status_history = status_history || $5::jsonb
+       WHERE id=$6 AND status='placed'
        RETURNING *`,
-      [dasherName, dasherPhone || null, dasherPhoto || null, dasherVehicle || null, id]
+      [
+        dasherName,
+        dasherPhone || null,
+        dasherPhoto || null,
+        dasherVehicle || null,
+        JSON.stringify([{ status: "assigned", at: Date.now() }]),
+        id,
+      ]
     );
 
     if (result.rows.length) {
-      return res.json({ order: mapOrderRow(result.rows[0]) });
+      const order = mapOrderRow(result.rows[0]);
+      io.to(`order:${id}`).emit("order_status", {
+        orderId: id,
+        status: order.status,
+        statusHistory: order.statusHistory,
+        updatedAt: Date.now(),
+      });
+      return res.json({ order });
     }
 
     const existing = await pool.query("SELECT id, status FROM orders WHERE id=$1", [id]);
@@ -359,16 +412,29 @@ app.post("/orders/:id/advance", async (req, res) => {
     }
 
     const photoColumn = current === "assigned" ? "pickup_photo" : current === "on_the_way" ? "delivery_photo" : null;
+    const historyEntry = JSON.stringify([{ status: next, at: Date.now() }]);
 
     const result = photoColumn
       ? await pool.query(
-          `UPDATE orders SET status=$1, ${photoColumn}=$2 WHERE id=$3 AND status=$4 RETURNING *`,
-          [next, photo, id, current]
+          `UPDATE orders SET status=$1, ${photoColumn}=$2, status_history = status_history || $3::jsonb
+           WHERE id=$4 AND status=$5 RETURNING *`,
+          [next, photo, historyEntry, id, current]
         )
-      : await pool.query("UPDATE orders SET status=$1 WHERE id=$2 AND status=$3 RETURNING *", [next, id, current]);
+      : await pool.query(
+          `UPDATE orders SET status=$1, status_history = status_history || $2::jsonb
+           WHERE id=$3 AND status=$4 RETURNING *`,
+          [next, historyEntry, id, current]
+        );
 
     if (!result.rows.length) return res.status(409).json({ error: "Order status changed, please refresh" });
     const order = mapOrderRow(result.rows[0]);
+
+    io.to(`order:${id}`).emit("order_status", {
+      orderId: id,
+      status: order.status,
+      statusHistory: order.statusHistory,
+      updatedAt: Date.now(),
+    });
 
     if (order.status === "delivered") {
       sendReceiptEmail(order).catch((err) => console.error("Receipt email error:", err.message));
@@ -384,21 +450,58 @@ app.post("/orders/:id/advance", async (req, res) => {
 app.post("/orders/:id/location", async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { lat, lng } = req.body;
+    const { lat, lng, heading, speed } = req.body;
     if (typeof lat !== "number" || typeof lng !== "number") {
       return res.status(400).json({ error: "lat and lng (numbers) are required" });
     }
     const result = await pool.query(
-      `UPDATE orders SET dasher_lat=$1, dasher_lng=$2, location_updated_at=$3
-       WHERE id=$4 AND status IN ('assigned','picked_up','on_the_way')
+      `UPDATE orders SET dasher_lat=$1, dasher_lng=$2, dasher_heading=$3, dasher_speed=$4, location_updated_at=$5
+       WHERE id=$6 AND status IN ('assigned','picked_up','on_the_way')
        RETURNING *`,
-      [lat, lng, Date.now(), id]
+      [lat, lng, heading ?? null, speed ?? null, Date.now(), id]
     );
     if (!result.rows.length) return res.status(409).json({ error: "Order is not active" });
-    res.json({ order: mapOrderRow(result.rows[0]) });
+    const order = mapOrderRow(result.rows[0]);
+
+    io.to(`order:${id}`).emit("dasher_location", {
+      orderId: id,
+      dasherId: order.dasherPhone,
+      lat: order.dasherLat,
+      lng: order.dasherLng,
+      heading: order.dasherHeading,
+      speed: order.dasherSpeed,
+      updatedAt: order.locationUpdatedAt,
+    });
+
+    res.json({ order });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not update location" });
+  }
+});
+
+// Customer app: full order + live tracking snapshot, called on tracking
+// screen mount so it isn't blank before the first socket event arrives.
+app.get("/api/orders/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const result = await pool.query("SELECT * FROM orders WHERE id=$1", [id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Order not found" });
+    const order = mapOrderRow(result.rows[0]);
+
+    let eta = null;
+    if (order.dasherLat != null && order.dasherLng != null && order.deliveryLat != null && order.deliveryLng != null && order.status !== "delivered") {
+      try {
+        eta = await getDrivingEta({ lat: order.dasherLat, lng: order.dasherLng }, { lat: order.deliveryLat, lng: order.deliveryLng });
+      } catch (e) {
+        eta = null; // don't fail the whole request if Directions API hiccups
+      }
+    }
+
+    res.json({ order, eta });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load order" });
   }
 });
 
@@ -450,9 +553,9 @@ app.post("/dashers", async (req, res) => {
 
 ensureSchema()
   .then(() => {
-    app.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT}`));
+    httpServer.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT}`));
   })
   .catch((err) => {
     console.error("Failed to set up database tables:", err.message);
-    app.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT} (database setup failed)`));
+    httpServer.listen(PORT, () => console.log(`DesiCart backend listening on port ${PORT} (database setup failed)`));
   });
